@@ -82,8 +82,61 @@ async def classify_category(session, semaphore, category, api_key, target_keywor
             return category, False, "error"
 
 # ==================================
+# Fonctions d'Export
+# ==================================
+
+def prepare_and_set_download_file(df_to_export, do_batch, rows_per_file, base_filename):
+    """Prépare les données du fichier pour le téléchargement et les stocke dans st.session_state."""
+    if do_batch and rows_per_file > 0:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            num_chunks = (len(df_to_export) - 1) // rows_per_file + 1
+            for i in range(num_chunks):
+                start_row = i * rows_per_file
+                end_row = start_row + rows_per_file
+                chunk_df = df_to_export.iloc[start_row:end_row]
+                file_name = f"results_batch_{i+1}.csv"
+                zip_file.writestr(file_name, chunk_df.to_csv(index=False).encode('utf-8'))
+        
+        st.session_state.download_file_bytes = zip_buffer.getvalue()
+        st.session_state.download_file_name = f"{base_filename}.zip"
+        st.session_state.download_file_mime = "application/zip"
+    else:
+        csv_bytes = df_to_export.to_csv(index=False).encode('utf-8')
+        st.session_state.download_file_bytes = csv_bytes
+        st.session_state.download_file_name = f"{base_filename}.csv"
+        st.session_state.download_file_mime = "text/csv"
+    
+    st.success("File is ready!")
+    st.rerun()
+
+def display_export_ui(df_for_export, keyword_for_filename):
+    """Affiche l'interface utilisateur pour l'exportation et gère la préparation du fichier."""
+    st.header("4. Export")
+    st.write(f"The final file contains **{len(df_for_export)}** rows.")
+
+    do_batch = st.toggle("Split file into multiple batches", key=f"batch_toggle_{keyword_for_filename}")
+    rows_per_file = 0
+    if do_batch:
+        rows_per_file = st.number_input("Max rows per file", min_value=1, value=40000, step=1000, key=f"rows_input_{keyword_for_filename}")
+    
+    if st.button("Prepare Download", type="primary", key=f"prepare_download_{keyword_for_filename}"):
+        base_filename = f"filtered_results_{keyword_for_filename.replace(' ', '_')}"
+        prepare_and_set_download_file(df_for_export, do_batch, rows_per_file, base_filename)
+
+# ==================================
 # Interface Utilisateur (UI)
 # ==================================
+
+def on_ai_toggle_change():
+    """Nettoie le session state lorsque le toggle AI est changé."""
+    keys_to_clear = [
+        'relevant_categories', 'df_classified', 'target_keyword', 'final_df', 
+        'download_file_bytes', 'download_file_name', 'download_file_mime'
+    ]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
 
 if check_password():
     st.title("🧹 GMaps File Cleaner")
@@ -139,64 +192,77 @@ if check_password():
                             df_current = df_current[pd.to_numeric(df_current['ratingCount'], errors='coerce').fillna(0) >= min_rating_count]
                         
                         st.metric(label="Rows remaining after pre-filtering", value=f"{len(df_current)}", delta=f"{len(df_current) - original_rows} rows")
-
-                st.header("2. Search Criteria")
-                target_keyword = st.text_input(
-                    "Enter your search criteria",
-                    placeholder="E.g., 'medical weight loss clinic'",
-                    help="The AI will look for categories related to this keyword."
+                
+                # --- NOUVELLE SECTION : TOGGLE POUR L'IA ---
+                st.header("2. AI-Powered Filtering")
+                use_ai_filtering = st.toggle(
+                    "Enable AI category filtering", 
+                    key='use_ai_filtering_toggle',
+                    on_change=on_ai_toggle_change
                 )
 
-                if st.button("Start Analysis and Classification", type="primary"):
-                    if not target_keyword:
-                        st.warning("Please enter a search criteria.")
-                    else:
-                        if 'relevant_categories' in st.session_state:
-                            for cat in st.session_state.relevant_categories:
-                                if f'cb_{cat}' in st.session_state:
-                                    del st.session_state[f'cb_{cat}']
-                        
-                        for key in ['relevant_categories', 'df_classified', 'target_keyword', 'final_df', 'download_file_bytes', 'download_file_name', 'download_file_mime']:
-                            if key in st.session_state:
-                                del st.session_state[key]
+                if use_ai_filtering:
+                    # --- WORKFLOW AVEC IA ---
+                    st.header("3. Search Criteria")
+                    target_keyword = st.text_input(
+                        "Enter your search criteria",
+                        placeholder="E.g., 'medical weight loss clinic'",
+                        help="The AI will look for categories related to this keyword."
+                    )
 
-                        unique_categories = df_current[CATEGORY_COL].dropna().unique()
-                        st.session_state.target_keyword = target_keyword
-
-                        progress_bar = st.progress(0, text=f"🔍 Analyzing {len(unique_categories)} unique categories...")
-
-                        async def run_classification():
-                            results = {}
-                            semaphore = asyncio.Semaphore(50)
-                            async with aiohttp.ClientSession() as session:
-                                tasks = [classify_category(session, semaphore, cat, api_key_input, target_keyword) for cat in unique_categories]
-                                
-                                processed_count = 0
-                                for f in asyncio.as_completed(tasks):
-                                    cat, is_relevant, reply = await f
-                                    results[cat] = is_relevant
-                                    processed_count += 1
-                                    progress_bar.progress(processed_count / len(unique_categories), text=f"🔍 Analysis: {processed_count}/{len(unique_categories)} categories processed...")
-                            
-                            return results
-
-                        results = asyncio.run(run_classification())
-                        
-                        progress_bar.empty()
-                        
-                        result_col_name = f"is_{target_keyword.replace(' ', '_').lower()}"
-                        df_current[result_col_name] = df_current[CATEGORY_COL].map(results)
-                        
-                        relevant_df = df_current[df_current[result_col_name] == True]
-                        kept_categories = relevant_df[CATEGORY_COL].dropna().unique().tolist()
-                        
-                        if kept_categories:
-                            st.session_state.df_classified = df_current
-                            st.session_state.relevant_categories = kept_categories
-                            st.success(f"{len(kept_categories)} relevant categories found!", icon="🎉")
-                            st.rerun()
+                    if st.button("Start Analysis and Classification", type="primary"):
+                        if not target_keyword:
+                            st.warning("Please enter a search criteria.")
                         else:
-                            st.warning("No relevant categories were found for this criteria.")
+                            # Nettoyage du state avant une nouvelle analyse
+                            on_ai_toggle_change()
+                            if 'relevant_categories' in st.session_state:
+                                for cat in st.session_state.relevant_categories:
+                                    if f'cb_{cat}' in st.session_state:
+                                        del st.session_state[f'cb_{cat}']
+                            
+                            unique_categories = df_current[CATEGORY_COL].dropna().unique()
+                            st.session_state.target_keyword = target_keyword
+
+                            progress_bar = st.progress(0, text=f"🔍 Analyzing {len(unique_categories)} unique categories...")
+
+                            async def run_classification():
+                                results = {}
+                                semaphore = asyncio.Semaphore(50)
+                                async with aiohttp.ClientSession() as session:
+                                    tasks = [classify_category(session, semaphore, cat, api_key_input, target_keyword) for cat in unique_categories]
+                                    
+                                    processed_count = 0
+                                    for f in asyncio.as_completed(tasks):
+                                        cat, is_relevant, reply = await f
+                                        results[cat] = is_relevant
+                                        processed_count += 1
+                                        progress_bar.progress(processed_count / len(unique_categories), text=f"🔍 Analysis: {processed_count}/{len(unique_categories)} categories processed...")
+                                
+                                return results
+
+                            results = asyncio.run(run_classification())
+                            
+                            progress_bar.empty()
+                            
+                            result_col_name = f"is_{target_keyword.replace(' ', '_').lower()}"
+                            df_current[result_col_name] = df_current[CATEGORY_COL].map(results)
+                            
+                            relevant_df = df_current[df_current[result_col_name] == True]
+                            kept_categories = relevant_df[CATEGORY_COL].dropna().unique().tolist()
+                            
+                            if kept_categories:
+                                st.session_state.df_classified = df_current
+                                st.session_state.relevant_categories = kept_categories
+                                st.success(f"{len(kept_categories)} relevant categories found!", icon="🎉")
+                                st.rerun()
+                            else:
+                                st.warning("No relevant categories were found for this criteria.")
+                else:
+                    # --- WORKFLOW SANS IA (EXPORT DIRECT) ---
+                    st.session_state.final_df = df_current
+                    st.session_state.target_keyword = "prefiltered"
+
 
         except Exception as e:
             st.error(f"An error occurred while reading the file: {e}")
@@ -244,38 +310,7 @@ if check_password():
                     st.rerun()
 
     if 'final_df' in st.session_state:
-        st.header("4. Export")
-        st.write(f"The final file contains **{len(st.session_state.final_df)}** rows.")
-
-        do_batch = st.toggle("Split file into multiple batches")
-        if do_batch:
-            rows_per_file = st.number_input("Max rows per file", min_value=1, value=40000, step=1000)
-        
-        if st.button("Prepare Download", type="primary"):
-            if do_batch and rows_per_file > 0:
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                    df_to_split = st.session_state.final_df
-                    num_chunks = (len(df_to_split) - 1) // rows_per_file + 1
-                    for i in range(num_chunks):
-                        start_row = i * rows_per_file
-                        end_row = start_row + rows_per_file
-                        chunk_df = df_to_split.iloc[start_row:end_row]
-                        
-                        file_name = f"results_batch_{i+1}.csv"
-                        zip_file.writestr(file_name, chunk_df.to_csv(index=False).encode('utf-8'))
-                
-                st.session_state.download_file_bytes = zip_buffer.getvalue()
-                st.session_state.download_file_name = f"filtered_results_{st.session_state.target_keyword.replace(' ', '_')}.zip"
-                st.session_state.download_file_mime = "application/zip"
-            else:
-                csv_bytes = st.session_state.final_df.to_csv(index=False).encode('utf-8')
-                st.session_state.download_file_bytes = csv_bytes
-                st.session_state.download_file_name = f"filtered_results_{st.session_state.target_keyword.replace(' ', '_')}.csv"
-                st.session_state.download_file_mime = "text/csv"
-            
-            st.success("File is ready!")
-            st.rerun()
+        display_export_ui(st.session_state.final_df, st.session_state.get('target_keyword', 'results'))
 
     if 'download_file_bytes' in st.session_state:
         st.download_button(
