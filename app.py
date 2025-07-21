@@ -228,7 +228,7 @@ if check_password():
 
                             async def run_classification():
                                 results = {}
-                                semaphore = asyncio.Semaphore(50)
+                                semaphore = asyncio.Semaphore(10)
                                 async with aiohttp.ClientSession() as session:
                                     tasks = [classify_category(session, semaphore, cat, api_key_input, target_keyword) for cat in unique_categories]
                                     
